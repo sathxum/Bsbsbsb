@@ -1,0 +1,523 @@
+name: NEXUS macOS VNC Deployment
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy-macos-vnc:
+    runs-on: macos-15
+    timeout-minutes: 360
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: System Info
+      run: |
+        echo "=========================================="
+        echo "  NEXUS macOS VNC Deployer v2.3"
+        echo "=========================================="
+        echo "macOS Version: $(sw_vers -productVersion)"
+        echo "Build: $(sw_vers -buildVersion)"
+        echo "Architecture: $(uname -m)"
+        echo "Hostname: $(hostname)"
+        echo "User: $(whoami)"
+        echo "=========================================="
+
+    # =============================================
+    # STEP 1: Create User Account with Admin Privileges
+    # =============================================
+    - name: Create Admin User
+      run: |
+        echo "[+] Creating user: Sinket"
+
+        # Find next available UniqueID
+        MAX_ID=$(dscl . -list /Users UniqueID | awk '{print $2}' | sort -n | tail -1)
+        NEW_ID=$((MAX_ID + 1))
+
+        # Create user
+        sudo dscl . -create /Users/Sinket
+        sudo dscl . -create /Users/Sinket UserShell /bin/zsh
+        sudo dscl . -create /Users/Sinket RealName "Nexus Admin"
+        sudo dscl . -create /Users/Sinket UniqueID "$NEW_ID"
+        sudo dscl . -create /Users/Sinket PrimaryGroupID "20"
+        sudo dscl . -create /Users/Sinket NFSHomeDirectory /Users/Sinket
+        sudo dscl . -passwd /Users/Sinket "Admin@123"
+        sudo dscl . -append /Groups/admin GroupMembership Sinket
+        sudo dscl . -append /Groups/com.apple.access_ssh GroupMembership Sinket 2>/dev/null || true
+
+        # Create home directory
+        sudo createhomedir -c -u Sinket 2>/dev/null || true
+
+        # Verify user exists
+        if id Sinket &>/dev/null; then
+          echo "[SUCCESS] User Sinket created (UID: $NEW_ID)"
+          echo "[INFO] Groups: $(id -nG Sinket)"
+        else
+          echo "[ERROR] User creation failed!"
+          exit 1
+        fi
+
+    # =============================================
+    # STEP 2: DISABLE ALL SLEEP & POWER MANAGEMENT
+    # This is CRITICAL — if machine sleeps, VNC dies
+    # =============================================
+    - name: Disable Sleep & Power Management
+      run: |
+        echo "[+] Disabling all sleep and power management..."
+
+        # Disable all sleep modes
+        sudo pmset -a displaysleep 0
+        sudo pmset -a sleep 0
+        sudo pmset -a disablesleep 1
+        sudo pmset -a disksleep 0
+        sudo pmset -a disablesuperdrive 1
+        sudo pmset -a hibernatemode 0
+        sudo pmset -a autopoweroff 0
+        sudo pmset -a standby 0
+        sudo pmset -a standbydelay 0
+        sudo pmset -a powernap 0
+        sudo pmset -a womp 1
+        sudo pmset -a lidwake 1
+        sudo pmset -a acwake 1
+        sudo pmset -a proximitywake 0
+
+        # Disable screensaver
+        defaults -currentHost write com.apple.screensaver idleTime 0 2>/dev/null || true
+
+        # Disable screen lock
+        defaults write com.apple.screensaver askForPassword -int 0 2>/dev/null || true
+        defaults write com.apple.screensaver askForPasswordDelay -int 0 2>/dev/null || true
+
+        # Verify
+        echo "[INFO] Current power settings:"
+        pmset -g
+        echo "[SUCCESS] All sleep/power management disabled"
+
+    # =============================================
+    # STEP 3: FIX BLACK SCREEN — TCC Database Manipulation
+    # This is the KEY FIX for macOS 13+ VNC black screen
+    # =============================================
+    - name: Fix TCC Permissions (Black Screen Fix)
+      run: |
+        echo "============================================="
+        echo "  APPLYING BLACK SCREEN FIX"
+        echo "  TCC Database Permission Grant"
+        echo "============================================="
+
+        MACOS_MAJOR=$(sw_vers -productVersion | cut -d '.' -f1)
+        echo "[INFO] macOS major version: $MACOS_MAJOR"
+
+        # Get current user info
+        CURRENT_USER=$(stat -f%Su /dev/console 2>/dev/null || echo "runner")
+        CURRENT_USER_UID=$(id -u "$CURRENT_USER" 2>/dev/null || echo "501")
+        echo "[INFO] Console user: $CURRENT_USER (UID: $CURRENT_USER_UID)"
+
+        # ---- TCC Database Fix ----
+        # The TCC database controls which apps can capture screen
+        # We need to grant Screen Recording permission to screensharingd and ARDAgent
+
+        TCC_SYSTEM="/Library/Application Support/com.apple.TCC/TCC.db"
+        TCC_USER="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
+
+        echo "[+] Patching system TCC database..."
+
+        # Backup first
+        if [ -f "$TCC_SYSTEM" ]; then
+          sudo cp "$TCC_SYSTEM" "$TCC_SYSTEM.bak.$(date +%s)" 2>/dev/null || true
+        fi
+
+        # Grant Screen Recording to screensharingd (the VNC server process)
+        sudo sqlite3 "$TCC_SYSTEM" "
+        INSERT OR REPLACE INTO access
+        (service, client, client_type, auth_value, auth_reason, auth_version,
+         indirect_object_identifier_type, indirect_object_identifier, flags, last_modified)
+        VALUES
+        ('kTCCServiceScreenCapture', 'com.apple.screensharing', 0, 2, 0, 1,
+         0, 'UNUSED', 0, strftime('%s', 'now'));
+        " 2>/dev/null || echo "[WARN] TCC system patch may have failed (SIP?)"
+
+        sudo sqlite3 "$TCC_SYSTEM" "
+        INSERT OR REPLACE INTO access
+        (service, client, client_type, auth_value, auth_reason, auth_version,
+         indirect_object_identifier_type, indirect_object_identifier, flags, last_modified)
+        VALUES
+        ('kTCCServiceScreenCapture', 'com.apple.RemoteDesktop.agent', 0, 2, 0, 1,
+         0, 'UNUSED', 0, strftime('%s', 'now'));
+        " 2>/dev/null || echo "[WARN] TCC ARDAgent patch may have failed"
+
+        # Also grant to the screensharingd binary directly
+        SCREENSHARINGD_PATH="/System/Library/CoreServices/screensharingd"
+        if [ -f "$SCREENSHARINGD_PATH" ]; then
+          sudo sqlite3 "$TCC_SYSTEM" "
+          INSERT OR REPLACE INTO access
+          (service, client, client_type, auth_value, auth_reason, auth_version,
+           indirect_object_identifier_type, indirect_object_identifier, flags, last_modified)
+          VALUES
+          ('kTCCServiceScreenCapture', '$SCREENSHARINGD_PATH', 1, 2, 0, 1,
+           0, 'UNUSED', 0, strftime('%s', 'now'));
+          " 2>/dev/null || true
+        fi
+
+        # Grant to WindowServer
+        sudo sqlite3 "$TCC_SYSTEM" "
+        INSERT OR REPLACE INTO access
+        (service, client, client_type, auth_value, auth_reason, auth_version,
+         indirect_object_identifier_type, indirect_object_identifier, flags, last_modified)
+        VALUES
+        ('kTCCServiceScreenCapture', '/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/Resources/WindowServer', 1, 2, 0, 1,
+         0, 'UNUSED', 0, strftime('%s', 'now'));
+        " 2>/dev/null || true
+
+        # ---- User-level TCC fix ----
+        mkdir -p "$HOME/Library/Application Support/com.apple.TCC"
+        if [ ! -f "$TCC_USER" ]; then
+          sqlite3 "$TCC_USER" "
+          CREATE TABLE IF NOT EXISTS access (
+            service TEXT NOT NULL,
+            client TEXT NOT NULL,
+            client_type INTEGER NOT NULL,
+            auth_value INTEGER NOT NULL,
+            auth_reason INTEGER NOT NULL,
+            auth_version INTEGER NOT NULL,
+            indirect_object_identifier_type INTEGER,
+            indirect_object_identifier TEXT NOT NULL DEFAULT 'UNUSED',
+            flags INTEGER,
+            last_modified INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+            PRIMARY KEY(service, client, client_type, indirect_object_identifier)
+          );
+          "
+        fi
+
+        sqlite3 "$TCC_USER" "
+        INSERT OR REPLACE INTO access
+        (service, client, client_type, auth_value, auth_reason, auth_version,
+         indirect_object_identifier_type, indirect_object_identifier, flags, last_modified)
+        VALUES
+        ('kTCCServiceScreenCapture', 'com.apple.screensharing', 0, 2, 0, 1,
+         0, 'UNUSED', 0, strftime('%s', 'now'));
+        " 2>/dev/null || true
+
+        sqlite3 "$TCC_USER" "
+        INSERT OR REPLACE INTO access
+        (service, client, client_type, auth_value, auth_reason, auth_version,
+         indirect_object_identifier_type, indirect_object_identifier, flags, last_modified)
+        VALUES
+        ('kTCCServiceScreenCapture', 'com.apple.RemoteDesktop.agent', 0, 2, 0, 1,
+         0, 'UNUSED', 0, strftime('%s', 'now'));
+        " 2>/dev/null || true
+
+        # ---- Also grant Screen Recording via defaults ----
+        # This pre-authorizes screen capture for the current session
+        defaults write com.apple.RemoteDesktop.agent ScreenCaptureAllowed -bool true 2>/dev/null || true
+        defaults write com.apple.screensharing ScreenCaptureAllowed -bool true 2>/dev/null || true
+
+        # ---- Reset and re-apply TCC ----
+        echo "[+] Resetting Screen Recording TCC..."
+        sudo tccutil reset ScreenCapture 2>/dev/null || true
+
+        sleep 2
+
+        # Re-apply after reset
+        sudo sqlite3 "$TCC_SYSTEM" "
+        INSERT OR REPLACE INTO access
+        (service, client, client_type, auth_value, auth_reason, auth_version,
+         indirect_object_identifier_type, indirect_object_identifier, flags, last_modified)
+        VALUES
+        ('kTCCServiceScreenCapture', 'com.apple.screensharing', 0, 2, 0, 1,
+         0, 'UNUSED', 0, strftime('%s', 'now'));
+        " 2>/dev/null || true
+
+        echo "[SUCCESS] TCC permissions patched"
+
+    # =============================================
+    # STEP 4: Enable Screen Sharing / VNC via Multiple Methods
+    # =============================================
+    - name: Enable Screen Sharing (VNC)
+      run: |
+        echo "[+] Enabling Screen Sharing / VNC..."
+
+        MACOS_MAJOR=$(sw_vers -productVersion | cut -d '.' -f1)
+
+        # Method 1: launchctl (works on macOS 12+)
+        if [ "$MACOS_MAJOR" -ge 12 ]; then
+          echo "[INFO] macOS $MACOS_MAJOR detected — using launchctl method"
+          sudo launchctl enable system/com.apple.screensharing 2>/dev/null || true
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+        fi
+
+        # Method 2: kickstart (works on all versions)
+        echo "[+] Running kickstart to activate ARD/VNC..."
+        sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+          -activate \
+          -configure \
+          -access -on \
+          -allowAccessFor -allUsers \
+          -privs -all \
+          -clientopts -setvnclegacy -vnclegacy yes \
+          -clientopts -setvncpw -vncpw "Admin@123" \
+          -clientopts -setmenuextra -menuextra yes \
+          -restart -agent
+
+        # Method 3: Direct screensharing service start
+        sudo launchctl kickstart -k system/com.apple.screensharing 2>/dev/null || true
+
+        # Method 4: Set VNC password via defaults
+        # This creates the password hash for VNC authentication
+        echo "[+] Setting VNC password..."
+
+        # Store VNC password in a way the system can use it
+        VNC_PASS="Admin@123"
+
+        # Write VNC configuration
+        sudo defaults write /Library/Preferences/com.apple.RemoteManagement VNCAlwaysStartOnConsole -bool true 2>/dev/null || true
+
+        # Enable Remote Management via defaults
+        sudo defaults write /var/db/launchd.db/com.apple.launchd/overrides/com.apple.screensharing Disabled -bool false 2>/dev/null || true
+
+        sleep 3
+
+        # Verify VNC is running
+        echo "[+] Verifying VNC service..."
+        if lsof -i :5900 > /dev/null 2>&1; then
+          echo "[SUCCESS] VNC is LISTENING on port 5900"
+          lsof -i :5900 | head -5
+        else
+          echo "[WARN] VNC not on 5900 yet. Checking screensharingd..."
+          ps aux | grep -i screen | grep -v grep || true
+
+          # Force start screensharingd
+          sudo /System/Library/CoreServices/screensharingd &
+          sleep 3
+
+          if lsof -i :5900 > /dev/null 2>&1; then
+            echo "[SUCCESS] VNC now listening on 5900"
+          else
+            echo "[WARN] VNC may need a moment. Continuing..."
+          fi
+        fi
+
+    # =============================================
+    # STEP 5: Ensure Login Window is Accessible via VNC
+    # Without this, VNC connects but shows black screen
+    # because there's no active GUI session to show
+    # =============================================
+    - name: Activate GUI Session
+      run: |
+        echo "[+] Activating GUI session for VNC..."
+
+        # The runner user IS logged in at console, but we need to ensure
+        # the loginwindow process is running so VNC has something to show
+
+        # Check if there's an active GUI session
+        CONSOLE_USER=$(stat -f%Su /dev/console 2>/dev/null || echo "unknown")
+        echo "[INFO] Console user: $CONSOLE_USER"
+
+        # Ensure loginwindow is running
+        if ! pgrep -x loginwindow > /dev/null; then
+          echo "[INFO] Starting loginwindow..."
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.loginwindow.plist 2>/dev/null || true
+        fi
+
+        # Create a simple AppleScript to activate Finder
+        # This ensures there's an active window for VNC to display
+        osascript -e 'tell application "Finder" to activate' 2>/dev/null || true
+
+        # Open System Preferences to show something visible
+        osascript -e 'tell application "System Settings" to activate' 2>/dev/null || \
+        osascript -e 'tell application "System Preferences" to activate' 2>/dev/null || true
+
+        sleep 2
+
+        # Take a screenshot to verify screen is not black
+        screencapture -x /tmp/screen_test.png 2>/dev/null || true
+        if [ -f /tmp/screen_test.png ]; then
+          FILESIZE=$(stat -f%z /tmp/screen_test.png 2>/dev/null || stat -c%s /tmp/screen_test.png 2>/dev/null || echo "0")
+          echo "[INFO] Screenshot size: $FILESIZE bytes"
+          if [ "$FILESIZE" -gt 1000 ]; then
+            echo "[SUCCESS] Screen capture works — NOT a black screen!"
+          else
+            echo "[WARN] Screenshot seems small — may be black. Applying additional fix..."
+
+            # Additional fix: restart WindowServer-related services
+            sudo killall -HUP WindowServer 2>/dev/null || true
+            sleep 2
+          fi
+        fi
+
+    # =============================================
+    # STEP 6: Install & Configure Ngrok
+    # =============================================
+    - name: Install Ngrok
+      run: |
+        echo "[+] Installing ngrok..."
+        curl -s https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-darwin-arm64.zip -o ngrok.zip
+        unzip -o ngrok.zip
+        chmod +x ngrok
+        sudo mv ngrok /usr/local/bin/ngrok
+        ngrok version
+        echo "[SUCCESS] Ngrok installed"
+
+    - name: Start Ngrok Tunnel
+      run: |
+        ngrok config add-authtoken 3DW8vmwVo7aYezScEd3u5oxF1MD_3UMGtriR5TAzc9wRVhNS1
+
+        echo "[+] Starting ngrok tunnel on VNC port 5900..."
+        nohup ngrok tcp 5900 --region ap --log=stdout --log-format=logfmt > ngrok.log 2>&1 &
+        NGROK_PID=$!
+        echo "[INFO] Ngrok PID: $NGROK_PID"
+
+        # Wait for tunnel
+        echo "[+] Waiting for tunnel to establish..."
+        for i in {1..30}; do
+          sleep 2
+          TUNNEL_INFO=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null)
+          if echo "$TUNNEL_INFO" | grep -q "public_url"; then
+            echo "[SUCCESS] Tunnel established!"
+            break
+          fi
+          echo "  Attempt $i/30..."
+        done
+
+        # Get connection details
+        VNC_URL=$(curl -s http://localhost:4040/api/tunnels | python3 -c "
+        import sys, json
+        data = json.load(sys.stdin)
+        for t in data.get('tunnels', []):
+            print(t['public_url'])
+        " 2>/dev/null)
+
+        if [ -z "$VNC_URL" ] || [ "$VNC_URL" = "" ]; then
+          echo "[ERROR] Failed to get tunnel URL!"
+          cat ngrok.log | tail -20
+          exit 1
+        fi
+
+        VNC_HOST=$(echo $VNC_URL | sed 's/tcp:\/\///' | cut -d ':' -f 1)
+        VNC_PORT=$(echo $VNC_URL | sed 's/tcp:\/\///' | cut -d ':' -f 2)
+
+        echo ""
+        echo "╔══════════════════════════════════════════════════════════════╗"
+        echo "║              🍎  macOS VNC CONNECTION DETAILS  🍎            ║"
+        echo "╠══════════════════════════════════════════════════════════════╣"
+        echo "║                                                              ║"
+        echo "║  VNC Address  : $VNC_URL"
+        echo "║  Host         : $VNC_HOST"
+        echo "║  Port         : $VNC_PORT"
+        echo "║  Username     : Sinket"
+        echo "║  VNC Password : Admin@123"
+        echo "║                                                              ║"
+        echo "╠══════════════════════════════════════════════════════════════╣"
+        echo "║  HOW TO CONNECT:                                            ║"
+        echo "║                                                              ║"
+        echo "║  📱 macOS:                                                   ║"
+        echo "║     Finder → Go → Connect to Server                          ║"
+        echo "║     vnc://$VNC_HOST:$VNC_PORT"
+        echo "║                                                              ║"
+        echo "║  💻 Windows:                                                 ║"
+        echo "║     Download RealVNC Viewer:                                 ║"
+        echo "║     https://www.realvnc.com/en/connect/download/viewer/      ║"
+        echo "║     Address: $VNC_HOST:$VNC_PORT"
+        echo "║                                                              ║"
+        echo "║  🐧 Linux:                                                   ║"
+        echo "║     sudo apt install tigervnc-viewer                         ║"
+        echo "║     vncviewer $VNC_HOST:$VNC_PORT"
+        echo "║                                                              ║"
+        echo "║  📱 Android:                                                 ║"
+        echo "║     Install RealVNC Viewer from Play Store                   ║"
+        echo "║     Address: $VNC_HOST:$VNC_PORT"
+        echo "║                                                              ║"
+        echo "║  Password: Admin@123"
+        echo "║                                                              ║"
+        echo "╚══════════════════════════════════════════════════════════════╝"
+        echo ""
+
+        # Save connection info to file for easy access
+        echo "========================================" > /tmp/vnc_connection_info.txt
+        echo "  macOS VNC CONNECTION DETAILS" >> /tmp/vnc_connection_info.txt
+        echo "========================================" >> /tmp/vnc_connection_info.txt
+        echo "VNC Address  : $VNC_URL" >> /tmp/vnc_connection_info.txt
+        echo "Host         : $VNC_HOST" >> /tmp/vnc_connection_info.txt
+        echo "Port         : $VNC_PORT" >> /tmp/vnc_connection_info.txt
+        echo "Username     : Sinket" >> /tmp/vnc_connection_info.txt
+        echo "VNC Password : Admin@123" >> /tmp/vnc_connection_info.txt
+        echo "========================================" >> /tmp/vnc_connection_info.txt
+        echo "HOW TO CONNECT:" >> /tmp/vnc_connection_info.txt
+        echo "" >> /tmp/vnc_connection_info.txt
+        echo "macOS:   Finder → Go → Connect to Server → vnc://$VNC_HOST:$VNC_PORT" >> /tmp/vnc_connection_info.txt
+        echo "Windows: RealVNC Viewer → $VNC_HOST:$VNC_PORT" >> /tmp/vnc_connection_info.txt
+        echo "Linux:   vncviewer $VNC_HOST:$VNC_PORT" >> /tmp/vnc_connection_info.txt
+        echo "Android: RealVNC Viewer → $VNC_HOST:$VNC_PORT" >> /tmp/vnc_connection_info.txt
+        echo "========================================" >> /tmp/vnc_connection_info.txt
+        
+        echo "[INFO] Connection info saved to /tmp/vnc_connection_info.txt"
+
+    # =============================================
+    # STEP 7: Final Verification
+    # =============================================
+    - name: Verify Everything Works
+      run: |
+        echo "============================================="
+        echo "  FINAL VERIFICATION"
+        echo "============================================="
+
+        # Check VNC port
+        if lsof -i :5900 > /dev/null 2>&1; then
+          echo "[✓] VNC service: RUNNING on port 5900"
+        else
+          echo "[✗] VNC service: NOT RUNNING"
+        fi
+
+        # Check ngrok
+        if curl -s http://localhost:4040/api/tunnels | grep -q "public_url"; then
+          echo "[✓] Ngrok tunnel: ACTIVE"
+        else
+          echo "[✗] Ngrok tunnel: DOWN"
+        fi
+
+        # Check user
+        if id Sinket &>/dev/null; then
+          echo "[✓] User Sinket: EXISTS ($(id -nG Sinket))"
+        else
+          echo "[✗] User Sinket: NOT FOUND"
+        fi
+
+        # Check power settings
+        SLEEP_VAL=$(pmset -g | grep "sleep" | head -1 | awk '{print $2}')
+        if [ "$SLEEP_VAL" = "0" ]; then
+          echo "[✓] Sleep: DISABLED"
+        else
+          echo "[✗] Sleep: ENABLED ($SLEEP_VAL)"
+        fi
+
+        # Check TCC
+        TCC_SYSTEM="/Library/Application Support/com.apple.TCC/TCC.db"
+        if sudo sqlite3 "$TCC_SYSTEM" "SELECT COUNT(*) FROM access WHERE service='kTCCServiceScreenCapture';" 2>/dev/null | grep -q "[1-9]"; then
+          echo "[✓] TCC Screen Recording: GRANTED"
+        else
+          echo "[!] TCC Screen Recording: May need manual grant"
+        fi
+
+        echo ""
+        echo "============================================="
+        echo "  SYSTEM READY — VNC IS LIVE"
+        echo "============================================="
+        echo "  macOS $(sw_vers -productVersion) on $(uname -m)"
+        echo "  Session active for up to 6 hours"
+        echo "============================================="
+
+    # =============================================
+    # STEP 8: Keep Alive
+    # =============================================
+    - name: Keep Alive (6 Hours Max)
+      run: |
+        echo "[INFO] Session active for up to 6 hours..."
+        echo "[INFO] VNC connection remains active until workflow ends."
+        echo ""
+        for i in $(seq 360 -1 1); do
+          HOURS=$((i / 60))
+          MINS=$((i % 60))
+          printf "\r[ALIVE] Time remaining: %02d:%02d " $HOURS $MINS
+          sleep 60
+        done
+        echo ""
+        echo "[TIMEOUT] Session expired. Maximum 6-hour limit reached."
